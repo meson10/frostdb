@@ -66,6 +66,9 @@ type TableConfig struct {
 	// rowGroupSize is the desired number of rows in each row group.
 	rowGroupSize     int
 	blockReaderLimit int
+	// blockRotationInterval is the interval after which a block is rotated if
+	// new transactions TODO
+	blockRotationInterval time.Duration
 }
 
 type TableOption func(*TableConfig) error
@@ -82,6 +85,14 @@ func WithRowGroupSize(numRows int) TableOption {
 func WithBlockReaderLimit(n int) TableOption {
 	return func(config *TableConfig) error {
 		config.blockReaderLimit = n
+		return nil
+	}
+}
+
+// TODO(asubiotto): Comment
+func WithBlockRotationInterval(interval time.Duration) TableOption {
+	return func(config *TableConfig) error {
+		config.blockRotationInterval = interval
 		return nil
 	}
 }
@@ -147,6 +158,9 @@ type TableBlock struct {
 
 	size  *atomic.Int64
 	index *atomic.Pointer[btree.BTree] // *btree.BTree
+
+	// hasNewInserts is observed by the blockSweeper.
+	hasNewInserts atomic.Bool
 
 	pendingWritersWg sync.WaitGroup
 
@@ -920,6 +934,11 @@ func newTableBlock(table *Table, prevTx, tx uint64, id ulid.ULID) (*TableBlock, 
 	index := atomic.Pointer[btree.BTree]{}
 	index.Store(btree.New(table.db.columnStore.indexDegree))
 
+	if prevTx == 0 && table.config.blockRotationInterval > 0 {
+		// First table block of the given table, start the sweeper.
+		table.db.blockSweeper.startNewSweeper(table, table.config.blockRotationInterval)
+	}
+
 	return &TableBlock{
 		table:  table,
 		index:  &index,
@@ -942,6 +961,7 @@ func (t *TableBlock) InsertRecord(ctx context.Context, tx uint64, record arrow.R
 	defer func() {
 		t.table.metrics.rowsInserted.Add(float64(record.NumRows()))
 		t.table.metrics.rowInsertSize.Observe(float64(record.NumRows()))
+		t.hasNewInserts.Store(true)
 	}()
 
 	if record.NumRows() == 0 {
@@ -960,6 +980,7 @@ func (t *TableBlock) Insert(ctx context.Context, tx uint64, buf *dynparquet.Seri
 	defer func() {
 		t.table.metrics.rowsInserted.Add(float64(buf.NumRows()))
 		t.table.metrics.rowInsertSize.Observe(float64(buf.NumRows()))
+		t.hasNewInserts.Store(true)
 	}()
 
 	numRows := buf.NumRows()

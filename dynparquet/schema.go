@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -104,8 +105,9 @@ type Schema struct {
 	sortingColumns []SortingColumn
 	dynamicColumns []int
 
-	writers *sync.Map
-	buffers *sync.Map
+	writers        *sync.Map
+	sortingWriters *sync.Map
+	buffers        *sync.Map
 }
 
 // IsDynamicColumn returns true if the passed in column is a dynamic column.
@@ -534,6 +536,7 @@ func newSchema(
 		sortingColumns: sortingColumns,
 		columnIndexes:  columnIndexes,
 		writers:        &sync.Map{},
+		sortingWriters: &sync.Map{},
 		buffers:        &sync.Map{},
 	}
 
@@ -1010,9 +1013,7 @@ func (s *Schema) SerializeBuffer(w io.Writer, buffer *Buffer) error {
 // was the default value used by parquet before it was made configurable.
 const bloomFilterBitsPerValue = 10
 
-// NewWriter returns a new parquet writer with a concrete parquet schema
-// generated using the given concrete dynamic column names.
-func (s *Schema) NewWriter(w io.Writer, dynamicColumns map[string][]string) (*parquet.GenericWriter[any], error) {
+func (s *Schema) writerOptions(dynamicColumns map[string][]string) ([]parquet.WriterOption, error) {
 	ps, err := s.DynamicParquetSchema(dynamicColumns)
 	if err != nil {
 		return nil, err
@@ -1036,7 +1037,7 @@ func (s *Schema) NewWriter(w io.Writer, dynamicColumns map[string][]string) (*pa
 		)
 	}
 
-	return parquet.NewGenericWriter[any](w,
+	return []parquet.WriterOption{
 		ps,
 		parquet.ColumnIndexSizeLimit(ColumnIndexSize),
 		parquet.BloomFilters(bloomFilterColumns...),
@@ -1047,7 +1048,27 @@ func (s *Schema) NewWriter(w io.Writer, dynamicColumns map[string][]string) (*pa
 		parquet.SortingWriterConfig(
 			parquet.SortingColumns(cols...),
 		),
-	), nil
+	}, nil
+}
+
+// NewWriter returns a new parquet writer with a concrete parquet schema
+// generated using the given concrete dynamic column names.
+func (s *Schema) NewWriter(w io.Writer, dynamicColumns map[string][]string) (*parquet.GenericWriter[any], error) {
+	opts, err := s.writerOptions(dynamicColumns)
+	if err != nil {
+		return nil, err
+	}
+	return parquet.NewGenericWriter[any](w, opts...), nil
+}
+
+func (s *Schema) NewSortingWriter(
+	w io.Writer, sortRowCount int64, dynamicColumns map[string][]string,
+) (*parquet.SortingWriter[any], error) {
+	opts, err := s.writerOptions(dynamicColumns)
+	if err != nil {
+		return nil, err
+	}
+	return parquet.NewSortingWriter[any](w, sortRowCount, opts...), nil
 }
 
 type PooledWriter struct {
@@ -1079,6 +1100,36 @@ func (s *Schema) GetWriter(w io.Writer, dynamicColumns map[string][]string) (*Po
 
 func (s *Schema) PutWriter(w *PooledWriter) {
 	w.GenericWriter.Reset(bytes.NewBuffer(nil))
+	w.pool.Put(w)
+}
+
+// TODO(asubiotto): Can we find an elegant way to merge this with the
+// PooledWriter type? Currently this is blocked on the ParquetWriter method.
+type PooledSortingWriter struct {
+	pool *sync.Pool
+	*parquet.SortingWriter[any]
+}
+
+func (s *Schema) GetSortingWriter(w io.Writer, dynamicColumns map[string][]string) (*PooledSortingWriter, error) {
+	key := serializeDynamicColumns(dynamicColumns)
+	pool, _ := s.sortingWriters.LoadOrStore(key, &sync.Pool{})
+	pooled := pool.(*sync.Pool).Get()
+	if pooled == nil {
+		new, err := s.NewSortingWriter(w, math.MaxInt64, dynamicColumns)
+		if err != nil {
+			return nil, err
+		}
+		return &PooledSortingWriter{
+			pool:          pool.(*sync.Pool),
+			SortingWriter: new,
+		}, nil
+	}
+	pooled.(*PooledSortingWriter).SortingWriter.Reset(w)
+	return pooled.(*PooledSortingWriter), nil
+}
+
+func (s *Schema) PutSortingWriter(w *PooledSortingWriter) {
+	w.SortingWriter.Reset(nil)
 	w.pool.Put(w)
 }
 

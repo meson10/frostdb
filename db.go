@@ -39,6 +39,7 @@ type ColumnStore struct {
 	tracer               trace.Tracer
 	granuleSizeBytes     int64
 	activeMemorySize     int64
+	blockSweepInterval   time.Duration
 	storagePath          string
 	bucket               storage.Bucket
 	ignoreStorageOnQuery bool
@@ -281,6 +282,7 @@ type DB struct {
 	txPool *TxPool
 
 	compactorPool *compactorPool
+	blockSweeper  *blockSweeperPool
 
 	// highWatermark maintains the highest consecutively completed tx number
 	highWatermark *atomic.Uint64
@@ -342,6 +344,7 @@ func (s *ColumnStore) DB(ctx context.Context, name string) (*DB, error) {
 	if dbSetupErr := func() error {
 		db.txPool = NewTxPool(db.highWatermark)
 		db.compactorPool = newCompactorPool(db, s.compactionConfig)
+		db.blockSweeper = newBlockSweeperPool(db)
 		// If bucket storage is configured; scan for existing tables in the database
 		if db.bucket != nil {
 			if err := db.bucket.Iter(ctx, "", func(tableName string) error {
@@ -375,6 +378,86 @@ func (s *ColumnStore) DB(ctx context.Context, name string) (*DB, error) {
 	db.compactorPool.start()
 	s.dbs[name] = db
 	return db, nil
+}
+
+// blockSweeperPool can start sweepers that sweep a given table every configured
+// interval and check if there have been no new writes for each table. If so,
+// the active table block is rotated.
+// The motivation for the blockSweeperPool is that a database might have small
+// tables that are rarely written to.
+type blockSweeperPool struct {
+	db          *DB
+	wg          sync.WaitGroup
+	cancelFuncs []context.CancelFunc
+}
+
+func newBlockSweeperPool(db *DB) *blockSweeperPool {
+	return &blockSweeperPool{
+		db: db,
+	}
+}
+
+func (b *blockSweeperPool) startNewSweeper(table *Table, interval time.Duration) {
+	ctx, cancelFn := context.WithCancel(context.Background())
+	b.cancelFuncs = append(b.cancelFuncs, cancelFn)
+	var curUlid *ulid.ULID
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+			case <-time.After(interval):
+				table.mtx.RLock()
+				if table.active == nil {
+					table.mtx.RUnlock()
+					// Table is not ready yet.
+					continue
+				}
+				table.mtx.RUnlock()
+
+				// Using active write block is important because it ensures that we don't
+				// miss pending writers when synchronizing the block.
+				block, close, err := table.ActiveWriteBlock()
+				if err != nil {
+					level.Info(b.db.logger).Log("msg", "could not get active write block", "err", err)
+				}
+				if block.hasNewInserts.Load() {
+					// Reset for the next sweep.
+					block.hasNewInserts.Store(false)
+					close()
+					continue
+				}
+				// If there were no inserts since the last sweep and the ulid
+				// is still the same (i.e. this is not a different block),
+				// rotate it.
+				if curUlid == nil || block.ulid.Compare(*curUlid) != 0 {
+					curUlid = &block.ulid
+					close()
+					continue
+				}
+
+				close()
+				if err := table.RotateBlock(block); err != nil {
+					level.Info(b.db.logger).Log(
+						"msg",
+						"could not rotate block in sweeper; WAL might grow unboundedly",
+						"err",
+						err,
+					)
+				}
+				curUlid = nil
+			}
+		}
+	}()
+}
+
+func (b *blockSweeperPool) stop() {
+	if b.cancelFuncs == nil {
+		return
+	}
+	for _, cancel := range b.cancelFuncs {
+		cancel()
+	}
+	b.wg.Wait()
 }
 
 func (db *DB) openWAL() (WAL, error) {
@@ -587,6 +670,9 @@ func (db *DB) Close() error {
 
 	if db.compactorPool != nil {
 		db.compactorPool.stop()
+	}
+	if db.blockSweeper != nil {
+		db.blockSweeper.stop()
 	}
 
 	return nil

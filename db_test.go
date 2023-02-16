@@ -1384,3 +1384,7 @@ func Test_DB_TableWrite_ArrowRecord(t *testing.T) {
 		})
 	}
 }
+
+func TestDBBlockSweeper(t *testing.T) {
+
+}
