@@ -7,6 +7,8 @@ import (
 	"io"
 	"math/rand"
 	"runtime"
+	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,6 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/polarsignals/frostdb/dynparquet"
 	schemapb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/schema/v1alpha1"
@@ -1788,4 +1791,72 @@ func Test_Table_DynamicColumnNotDefined(t *testing.T) {
 
 	_, err = table.Write(context.Background(), record)
 	require.NoError(t, err)
+}
+
+func TestConcurrentInsert(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	logger := newTestLogger(t)
+	c, err := New(WithLogger(logger))
+	require.NoError(t, err)
+	defer c.Close()
+
+	const (
+		dbAndTableName = "test"
+	)
+	ctx := context.Background()
+	db, err := c.DB(ctx, dbAndTableName)
+	require.NoError(t, err)
+
+	table, err := db.Table(dbAndTableName, NewTableConfig(&schemapb.Schema{
+		Name: "test_schema",
+		Columns: []*schemapb.Column{{
+			Name: "strings",
+			StorageLayout: &schemapb.StorageLayout{
+				Type:     schemapb.StorageLayout_TYPE_STRING,
+				Encoding: schemapb.StorageLayout_ENCODING_PLAIN_UNSPECIFIED,
+			},
+		}},
+		SortingColumns: []*schemapb.SortingColumn{{Name: "strings", Direction: schemapb.SortingColumn_DIRECTION_ASCENDING}},
+	}))
+	require.NoError(t, err)
+
+	arrowSchema, err := pqarrow.ParquetSchemaToArrowSchema(
+		ctx, table.Schema().ParquetSchema(), logicalplan.IterOptions{},
+	)
+	require.NoError(t, err)
+
+	var errg errgroup.Group
+	const numVals = 5
+	expected := make([]int, numVals)
+	for i := 0; i < numVals; i++ {
+		v := i
+		expected[i] = i
+		errg.Go(func() error {
+			rb := array.NewRecordBuilder(mem, arrowSchema)
+			defer rb.Release()
+			rb.Field(0).(*array.BinaryBuilder).AppendString(strconv.Itoa(v))
+			r := rb.NewRecord()
+			defer r.Release()
+			_, err := table.InsertRecord(ctx, r)
+			return err
+		})
+	}
+	require.NoError(t, errg.Wait())
+
+	// Ensure all values can be observed.
+	found := make([]int, 0)
+	require.NoError(t, query.NewEngine(mem, db.TableProvider()).ScanTable(dbAndTableName).Execute(
+		ctx, func(ctx context.Context, r arrow.Record) error {
+			for i := 0; int64(i) < r.NumRows(); i++ {
+				v, err := strconv.Atoi(string(r.Columns()[0].(*array.Binary).Value(i)))
+				if err != nil {
+					return err
+				}
+				found = append(found, v)
+			}
+			return nil
+		},
+	))
+	sort.Ints(found)
+	require.Equal(t, expected, found)
 }
